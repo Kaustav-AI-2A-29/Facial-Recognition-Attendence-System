@@ -1,0 +1,13 @@
+# Smart Facial Recognition Attendance System
+# Install all dependencies with:
+#   pip install -r requirements.txt
+
+opencv-python>=4.8.0
+face_recognition>=1.3.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# face_recognition depends on dlib. On Windows you may need:
+#   pip install cmake
+#   pip install dlib
+# before installing face_recognition.
