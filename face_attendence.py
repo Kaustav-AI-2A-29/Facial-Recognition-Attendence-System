@@ -28,6 +28,7 @@ import queue
 import logging
 from datetime import datetime
 from pathlib import Path
+from PIL import Image
 
 # ─────────────────────────────────────────────────────────────
 #  LOGGING
@@ -44,11 +45,12 @@ log = logging.getLogger("attendance")
 # ─────────────────────────────────────────────────────────────
 DATASET_DIR      = "dataset"        # Sub-folders per person  OR  flat Name.jpg files
 ATTENDANCE_FILE  = "attendance.csv"
-TOLERANCE        = 0.48             # Lower = stricter (recommended: 0.45–0.52)
-CONFIDENCE_MIN   = 0.52             # Min confidence (1-distance) to show a name
+TOLERANCE        = 0.40             # Lower = stricter (0.40–0.42 = strict, 0.45–0.52 = loose)
+CONFIDENCE_MIN   = 0.62             # Min confidence (1-distance) to show a name [INCREASED]
 FRAME_SCALE      = 0.25             # Downsample factor before detection
 PROCESS_EVERY_N  = 2                # Run detection on every Nth frame
-CONFIRM_FRAMES   = 3                # Consecutive identical labels before accepting
+CONFIRM_FRAMES   = 5                # Consecutive identical labels before accepting [INCREASED]
+MIN_FACE_SIZE    = 50               # Minimum face width to detect (filters artifacts)
 FACE_MODEL       = "hog"            # "hog" (fast CPU) or "cnn" (accurate, needs GPU)
 USE_CLAHE        = True             # Adaptive histogram equalisation for lighting
 CLAHE_CLIP       = 2.0              # CLAHE clip limit (1.5–3.0)
@@ -69,12 +71,31 @@ COL_HUD     = (200, 200, 200)
 # ═══════════════════════════════════════════════════════════════
 
 def _read_rgb(path: str):
-    """Read image file → RGB numpy array, or None on failure."""
-    img = cv2.imread(path)
-    if img is None:
-        log.warning("Cannot read '%s' – skipped.", path)
+    """Read image using PIL then OpenCV to handle color space issues."""
+    try:
+        # Try PIL first to ensure proper RGB conversion
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(path)
+        
+        # Convert to RGB if needed (handles CMYK, grayscale, etc.)
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        
+        # Convert PIL Image to numpy array (PIL returns RGB)
+        img_rgb = np.array(pil_img, dtype=np.uint8)
+        
+        # Ensure C-contiguous (critical for dlib)
+        img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
+        
+        # Validate format
+        if img_rgb.dtype != np.uint8 or len(img_rgb.shape) != 3 or img_rgb.shape[2] != 3:
+            log.warning("Failed to convert '%s' to valid RGB format", path)
+            return None
+        
+        return img_rgb
+    except Exception as e:
+        log.warning("Error reading '%s' – %s", path, e)
         return None
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def load_and_encode_dataset(dataset_dir: str):
@@ -134,11 +155,43 @@ def load_and_encode_dataset(dataset_dir: str):
             img_rgb = _read_rgb(str(p))
             if img_rgb is None:
                 continue
-            encs = face_recognition.face_encodings(img_rgb)
-            if not encs:
-                log.warning("  No face in '%s' – skipped.", p.name)
+            
+            # Detect faces first, then encode
+            try:
+                # Validate image dimensions before face detection
+                if img_rgb.shape[0] < 50 or img_rgb.shape[1] < 50:
+                    log.warning("  Image '%s' too small (%dx%d) – skipped.", p.name, img_rgb.shape[1], img_rgb.shape[0])
+                    continue
+                
+                locs = face_recognition.face_locations(img_rgb, model="hog")
+                if not locs:
+                    log.warning("  No face in '%s' – skipped.", p.name)
+                    continue
+                encs = face_recognition.face_encodings(img_rgb, locs)
+                if not encs:
+                    log.warning("  Could not encode face in '%s' – skipped.", p.name)
+                    continue
+                enc_list.append(encs[0])
+                log.info("  ✔  Loaded '%s/%s'", name, p.name)
+            except RuntimeError as e:
+                log.warning("  dlib error in '%s': %s – retrying with CNN…", p.name, e)
+                try:
+                    # Fallback to CNN model which may handle images differently
+                    locs = face_recognition.face_locations(img_rgb, model="cnn")
+                    if locs:
+                        encs = face_recognition.face_encodings(img_rgb, locs)
+                        if encs:
+                            enc_list.append(encs[0])
+                            log.info("  ✔  Loaded (CNN) '%s/%s'", name, p.name)
+                        else:
+                            log.warning("  Could not encode face in '%s' (CNN) – skipped.", p.name)
+                    else:
+                        log.warning("  No face found in '%s' (CNN) – skipped.", p.name)
+                except Exception as e2:
+                    log.warning("  CNN also failed for '%s': %s – skipped.", p.name, e2)
+            except Exception as e:
+                log.warning("  Error processing '%s': %s – skipped.", p.name, e)
                 continue
-            enc_list.append(encs[0])
 
         if not enc_list:
             log.warning("  No valid encodings for '%s' – person skipped.", name)
@@ -407,6 +460,14 @@ def recognize_faces(known_encodings, known_names, writer):
             small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
             locs = face_recognition.face_locations(small_rgb, model=FACE_MODEL)
+            
+            # ▼ NEW: Filter faces by size (removes tiny artifacts/backgrounds)
+            filtered_locs = [
+                (top, right, bottom, left) for (top, right, bottom, left) in locs
+                if (right - left) >= MIN_FACE_SIZE  # Width must be at least MIN_FACE_SIZE
+            ]
+            locs = filtered_locs
+            
             encs = face_recognition.face_encodings(small_rgb, locs)
 
             new_labels   = []
@@ -423,6 +484,9 @@ def recognize_faces(known_encodings, known_names, writer):
                     best = int(np.argmin(distances))
                     conf = max(0.0, 1.0 - distances[best])
 
+                    # ▼ STRICTER: Require BOTH:
+                    #   1. matches[best] says it's a match AND
+                    #   2. confidence is above high threshold (0.62 instead of 0.52)
                     if matches[best] and conf >= CONFIDENCE_MIN:
                         proposed  = known_names[best]
                         confirmed = buf.update(fid, proposed)
@@ -430,10 +494,14 @@ def recognize_faces(known_encodings, known_names, writer):
 
                         if confirmed:
                             label, color = confirmed, COL_KNOWN
+                            log.debug(f"CONFIRMED MATCH: {confirmed} (confidence: {conf:.2f})")
                             writer.record(label)
                         elif pending:
                             label, color = proposed, COL_PENDING
                     else:
+                        # ▼ NEW: Log when a face doesn't meet confidence threshold
+                        if len(known_encodings) > 0 and distances[best] < 0.6:
+                            log.debug(f"LOW CONFIDENCE: {known_names[best]} ({conf:.2f}) - REJECTED")
                         buf.update(fid, "Unknown")
 
                 new_labels.append((label, conf, color, buf.is_pending(fid)))
