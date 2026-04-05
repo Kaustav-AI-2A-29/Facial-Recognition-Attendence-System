@@ -1,8 +1,44 @@
 """
 ============================================================
-  Smart Facial Recognition Attendance System (OpenCV Version)
-  Uses OpenCV face detection instead of dlib
+  Smart Facial Recognition Attendance System
+  OpenCV LBPH Edition  —  NO dlib required
+  Author   : AI/ML Engineer (Claude)
   Run with : python face_attendence_opencv.py
+
+  Requirements
+  ─────────────
+  pip install opencv-contrib-python   ← NOT opencv-python
+  pip install numpy pandas
+
+  Why LBPH instead of hash matching?
+  ────────────────────────────────────
+  Perceptual hash (the old approach) compares raw pixel patterns.
+  It cannot distinguish between two people and is trivially fooled
+  by lighting changes, angle, or textured backgrounds.
+
+  LBPH (Local Binary Pattern Histograms) is OpenCV's purpose-built
+  face recognition algorithm. It:
+    • Encodes local texture patterns around each pixel
+    • Is robust to lighting variation
+    • Returns a real distance score (lower = closer match)
+    • Trains in seconds on a small dataset
+    • Runs entirely on CPU with no GPU or dlib needed
+
+  Bug fixes over previous version
+  ─────────────────────────────────
+  BUG 1 — Misidentification
+    Old: hash + histogram similarity (not face recognition)
+    Fix: LBPH recognizer trained on reference face crops
+
+  BUG 2 — Two people marked when one is present
+    Old: Confirmation buffer reset on ANY background detection
+    Fix: Position-based buffer (face_id) tracks each detected
+         face independently — background noise cannot reset it
+
+  BUG 3 — Background objects detected as faces
+    Old: Haar cascade with weak parameters + no size/shape filter
+    Fix: minNeighbors=8 + MIN_FACE_SIZE=80px + aspect ratio gate
+         + CLAHE normalisation before detection
 ============================================================
 """
 
@@ -15,314 +51,606 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-# Logging setup
+# ─────────────────────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("attendance")
+log = logging.getLogger("attendance_opencv")
 
-# Configuration
-DATASET_DIR = "dataset"
+# ─────────────────────────────────────────────────────────────
+#  CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+DATASET_DIR    = "dataset"
 ATTENDANCE_FILE = "attendance.csv"
-CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-WEBCAM_WIDTH = 1280
+
+# LBPH recognizer settings
+# Lower confidence = better match. 0 = perfect, 100+ = poor match.
+# Tune here if recognition is too strict or too loose:
+LBPH_THRESHOLD = 70          # Accept match only if confidence < this value
+                              # Try 75 if faces are missed; try 60 if wrong person shown
+
+# Face detection (Haar cascade)
+CASCADE_PATH        = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+HAAR_SCALE          = 1.08   # Smaller = more detections but slower (1.05–1.15)
+HAAR_MIN_NEIGHBORS  = 8      # Higher = fewer false positives (6–10)
+MIN_FACE_SIZE       = 80     # Pixels — rejects hands, shadows, small objects
+MAX_FACE_RATIO      = 1.5    # Max width/height ratio — rejects elongated shapes
+
+# Confirmation: require N consecutive matching frames before marking attendance
+CONFIRM_FRAMES  = 5          # At ~15 fps effective = ~330 ms of agreement
+
+# Frame processing
+PROCESS_EVERY_N = 2          # Detect on every Nth frame (reduces CPU load)
+FRAME_SCALE     = 0.5        # Downsample for detection (0.5 = half size, faster)
+
+# CLAHE lighting normalisation
+USE_CLAHE  = True
+CLAHE_CLIP = 2.5
+CLAHE_TILE = (8, 8)
+
+# Webcam
+WEBCAM_INDEX  = 0
+WEBCAM_WIDTH  = 1280
 WEBCAM_HEIGHT = 720
-MIN_FACE_SIZE = 80              # ✓ INCREASED: Filter tiny artifacts (was 50)
-MIN_MATCHES = 8                 # ✓ INCREASED: More confirmations needed (was 5)
-SIMILARITY_THRESHOLD = 0.75     # ✓ MUCH STRICTER: Raise from 0.65 to 0.75
-HAAR_SCALE = 1.05              # ✓ NEW: More conservative detection (was 1.1)
-HAAR_MIN_NEIGHBORS = 6          # ✓ NEW: More neighbors = fewer false positives
 
-# Colors (BGR)
-COL_KNOWN = (0, 210, 100)
-COL_UNKNOWN = (0, 60, 220)
-COL_HUD = (200, 200, 200)
+# Display colours (BGR)
+COL_KNOWN   = (0, 210, 100)   # Green  – confirmed identity
+COL_UNKNOWN = (0, 60, 220)    # Red    – not recognised
+COL_PENDING = (0, 190, 220)   # Amber  – accumulating confirmation frames
+COL_HUD     = (200, 200, 200)
+
+# Reference image size fed to LBPH (must be consistent)
+FACE_SIZE = (200, 200)
 
 
-def load_images_simple(dataset_dir: str):
-    """Load images from dataset folder (flat or nested structure)."""
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 1 — CHECK opencv-contrib IS INSTALLED
+# ═══════════════════════════════════════════════════════════════
+
+def _check_contrib():
+    """
+    Raise a clear error if opencv-contrib-python is not installed.
+    The cv2.face module (which contains LBPHFaceRecognizer) is ONLY
+    available in opencv-contrib-python, not in plain opencv-python.
+    """
+    if not hasattr(cv2, "face"):
+        raise ImportError(
+            "\n\n  MISSING: cv2.face module not found.\n"
+            "  You need opencv-contrib-python, not opencv-python.\n\n"
+            "  Fix:\n"
+            "    pip uninstall opencv-python -y\n"
+            "    pip install opencv-contrib-python\n"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 2 — LIGHTING NORMALISATION (CLAHE)
+# ═══════════════════════════════════════════════════════════════
+
+def make_clahe():
+    return cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+
+
+def apply_clahe_gray(gray: np.ndarray, clahe) -> np.ndarray:
+    """Apply CLAHE directly to a grayscale image."""
+    return clahe.apply(gray)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 3 — DATASET LOADER + LBPH TRAINER
+# ═══════════════════════════════════════════════════════════════
+
+def build_lbph_recognizer(dataset_dir: str, cascade: cv2.CascadeClassifier):
+    """
+    Scan the dataset folder, extract face crops from each reference image,
+    and train an LBPH recognizer.
+
+    Returns
+    -------
+    recognizer : cv2.face.LBPHFaceRecognizer  (trained)
+    label_map  : dict[int, str]  — maps integer label → person name
+    name_map   : dict[str, int]  — reverse: person name → integer label
+
+    Why LBPH?
+    ---------
+    LBPH divides a face image into a grid of cells. For each pixel it
+    computes an 8-bit binary code comparing the pixel to its 8 neighbours.
+    The resulting histogram per cell captures local texture patterns that
+    are robust to:
+      • Uniform lighting changes (monotone transform leaves patterns intact)
+      • Small pose / expression differences
+      • Mild occlusion
+
+    Training is instant (milliseconds) and prediction runs at >30 fps on CPU.
+    LBPH confidence is a chi-square distance — 0 = perfect match, 100+ = poor.
+    We accept a match only when confidence < LBPH_THRESHOLD (default 70).
+
+    Folder layouts supported
+    -------------------------
+    A) Flat   : dataset/Alice.jpg  dataset/Bob.jpg
+    B) Nested : dataset/Alice/img1.jpg  dataset/Alice/img2.jpg  …
+    """
     supported = {".jpg", ".jpeg", ".png", ".bmp"}
     root = Path(dataset_dir)
 
     if not root.is_dir():
-        raise FileNotFoundError(f"Dataset folder '{dataset_dir}' not found.")
+        raise FileNotFoundError(
+            f"Dataset folder '{dataset_dir}' not found. "
+            "Create it and add face images."
+        )
 
-    person_files = {}
-
-    # Check for nested structure (subfolders per person)
+    # Build {name: [Path, …]}
+    person_files: dict[str, list] = {}
     for sub in sorted(root.iterdir()):
         if sub.is_dir():
             imgs = [f for f in sub.iterdir() if f.suffix.lower() in supported]
             if imgs:
                 person_files[sub.name] = imgs
-
-    # Fallback to flat structure
     if not person_files:
         for f in sorted(root.iterdir()):
             if f.is_file() and f.suffix.lower() in supported:
                 person_files.setdefault(f.stem, []).append(f)
 
     if not person_files:
-        raise ValueError(f"No images found in '{dataset_dir}'.")
+        raise ValueError(
+            f"No face images found in '{dataset_dir}'. "
+            "Add .jpg/.png files or sub-folders named after each person."
+        )
 
-    images_dict = {}
-    log.info("Loading images from '%s'", dataset_dir)
+    clahe = make_clahe()
+    label_map: dict[int, str] = {}
+    name_map:  dict[str, int] = {}
+    faces_train: list[np.ndarray] = []
+    labels_train: list[int]       = []
+
+    log.info("Training LBPH recognizer from '%s' …", dataset_dir)
+    label_id = 0
 
     for name, paths in person_files.items():
-        images_dict[name] = []
+        label_map[label_id] = name
+        name_map[name]      = label_id
+        face_count = 0
+
         for p in paths:
             img = cv2.imread(str(p))
             if img is None:
-                log.warning("  Cannot read '%s'", p.name)
+                log.warning("  Cannot read '%s' – skipped.", p.name)
                 continue
-            images_dict[name].append(img)
-            log.info("  ✔  Loaded '%s/%s'", name, p.name)
 
-    return images_dict
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = apply_clahe_gray(gray, clahe)  # Normalise lighting
 
+            # Try to auto-detect and crop the face in the reference image
+            detected = cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5,
+                minSize=(50, 50)
+            )
 
-def compute_image_hash(img):
-    """Compute multi-scale perceptual hash for better matching."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, (8, 8))
-    avg = small.mean()
-    return (small > avg).flatten()
+            if len(detected) > 0:
+                # Use the largest detected face
+                (x, y, w, h) = max(detected, key=lambda r: r[2] * r[3])
+                face_crop = gray[y:y+h, x:x+w]
+            else:
+                # No face found in reference image — use the whole image.
+                # This is a fallback; ideally every reference image has a
+                # clearly visible face.
+                log.warning(
+                    "  No face detected in '%s/%s' — using full image as fallback.",
+                    name, p.name
+                )
+                face_crop = gray
 
+            # Normalise to consistent size
+            face_crop = cv2.resize(face_crop, FACE_SIZE)
+            faces_train.append(face_crop)
+            labels_train.append(label_id)
+            face_count += 1
 
-def compute_histogram(img):
-    """Compute color histogram for additional matching."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
-    hist = cv2.normalize(hist, hist).flatten()
-    return hist
+        if face_count == 0:
+            log.warning("  No usable images for '%s' – person skipped.", name)
+            del label_map[label_id]
+            del name_map[name]
+        else:
+            log.info("  ✔  %-20s  %d image(s) → LBPH trained", name, face_count)
+            label_id += 1
 
+    if not faces_train:
+        raise ValueError(
+            "No face images could be loaded for training. "
+            "Ensure dataset images contain clear, front-facing faces."
+        )
 
-def match_face_simple(ref_img, test_img, threshold=0.75):
-    """Enhanced face matching using hash + histogram similarity."""
-    
-    # ✓ STRICT: Validate both images
-    if test_img is None or test_img.size == 0:
-        return False, 0.0
-    if ref_img is None or ref_img.size == 0:
-        return False, 0.0
-    
-    # ✓ NEW: Aspect ratio check (real faces are roughly square, 1.5:1 max)
-    ref_h, ref_w = ref_img.shape[:2]
-    test_h, test_w = test_img.shape[:2]
-    
-    ref_aspect = max(ref_w, ref_h) / max(min(ref_w, ref_h), 1)
-    test_aspect = max(test_w, test_h) / max(min(test_w, test_h), 1)
-    
-    if ref_aspect > 2.0 or test_aspect > 2.0:
-        return False, 0.0  # Not a real face - too elongated
-    
-    # Resize test_img to match reference for fair comparison
-    if ref_img.shape != test_img.shape:
-        test_img = cv2.resize(test_img, (ref_w, ref_h))
-    
-    # ✓ IMPROVED: Multi-metric matching
-    # 1. Hash-based similarity
-    ref_hash = compute_image_hash(ref_img)
-    test_hash = compute_image_hash(test_img)
-    hash_similarity = 1 - (np.sum(ref_hash != test_hash) / len(ref_hash))
-    
-    # 2. Histogram similarity (color consistency)
-    try:
-        ref_hist = compute_histogram(ref_img)
-        test_hist = compute_histogram(test_img)
-        hist_similarity = cv2.compareHist(ref_hist, test_hist, cv2.HISTCMP_BHATTACHARYYA)
-        hist_similarity = 1 - min(hist_similarity, 1.0)  # Convert to 0-1 scale
-    except:
-        hist_similarity = hash_similarity  # Fallback if histogram fails
-    
-    # ✓ COMBINED: Both metrics must agree
-    combined_similarity = (hash_similarity + hist_similarity) / 2.0
-    
-    log.debug(f"  Hash: {hash_similarity:.2f} | Hist: {hist_similarity:.2f} | Combined: {combined_similarity:.2f}")
-    
-    return combined_similarity >= threshold, combined_similarity
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.train(faces_train, np.array(labels_train))
+    log.info("LBPH training complete — %d person(s) enrolled.\n", len(label_map))
+    return recognizer, label_map, name_map
 
 
-def initialize_csv(filepath: str):
-    """Create CSV file if it doesn't exist."""
-    if not os.path.isfile(filepath):
-        with open(filepath, "w", newline="") as f:
-            csv.writer(f).writerow(["Name", "Date", "Time"])
-        log.info("Created attendance file: '%s'", filepath)
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 4 — FACE DETECTION WITH FALSE-POSITIVE FILTERING
+# ═══════════════════════════════════════════════════════════════
+
+def detect_faces(gray: np.ndarray,
+                 cascade: cv2.CascadeClassifier) -> list[tuple]:
+    """
+    Detect faces in a grayscale frame and apply three filters to remove
+    false positives (background objects, hands, shadows).
+
+    Filter 1 — minNeighbors=8
+        The Haar cascade votes: each candidate window is kept only if at
+        least N overlapping windows also detect a face there. Higher N means
+        fewer spurious detections. 8 is strict; use 6 on dim cameras.
+
+    Filter 2 — minimum size (MIN_FACE_SIZE)
+        Rejects detections smaller than 80×80 pixels. Background objects
+        and distant incidental detections are typically <40 px.
+
+    Filter 3 — aspect ratio (MAX_FACE_RATIO)
+        A human face is roughly square. We reject detections where
+        width/height or height/width exceeds 1.5, which eliminates
+        elongated shapes (books, screens, door frames).
+
+    Returns list of (x, y, w, h) tuples for faces that pass all filters.
+    """
+    raw = cascade.detectMultiScale(
+        gray,
+        scaleFactor=HAAR_SCALE,
+        minNeighbors=HAAR_MIN_NEIGHBORS,
+        minSize=(MIN_FACE_SIZE, MIN_FACE_SIZE),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+
+    if len(raw) == 0:
+        return []
+
+    valid = []
+    for (x, y, w, h) in raw:
+        ratio = max(w, h) / max(min(w, h), 1)
+        if ratio <= MAX_FACE_RATIO:
+            valid.append((x, y, w, h))
+
+    return valid
 
 
-def mark_attendance(filepath: str, name: str, marked_today: set):
-    """Record attendance if not already done today."""
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    key = f"{name}|{today}"
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 5 — N-FRAME CONFIRMATION BUFFER
+# ═══════════════════════════════════════════════════════════════
 
-    if key in marked_today:
-        return marked_today
+class ConfirmationBuffer:
+    """
+    Require CONFIRM_FRAMES consecutive identical labels before accepting.
 
-    # Check CSV
-    try:
-        df = pd.read_csv(filepath)
-        if not df[(df["Name"] == name) & (df["Date"] == today)].empty:
-            marked_today.add(key)
-            return marked_today
-    except (pd.errors.EmptyDataError, FileNotFoundError):
-        pass
+    Keyed by face_id (the index of the face in the current frame's
+    detection list), NOT by name.  This is the critical fix over the
+    old implementation:
 
-    # Record
-    with open(filepath, "a", newline="") as f:
-        csv.writer(f).writerow([name, today, now.strftime("%H:%M:%S")])
+    OLD (broken): buffer.reset() when ANY "Unknown" face appeared.
+    → One background detection cleared the whole buffer for real faces.
 
-    log.info("  [MARK] %s | %s | %s", name, today, now.strftime("%H:%M:%S"))
-    marked_today.add(key)
-    return marked_today
+    NEW (correct): each face position has its own independent history.
+    → Background detections don't interfere with the real face's buffer.
+    → Buffer entries for positions that disappear are cleaned up via
+      clear_stale(), not on-detection.
+
+    State transitions
+    -----------------
+    pending  : 1 ≤ hits < CONFIRM_FRAMES  (amber box shown)
+    confirmed: hits == CONFIRM_FRAMES, all same label (green box)
+    unknown  : no consistent label in window (red box)
+    """
+
+    def __init__(self):
+        self._hist: dict[int, list[str]] = {}
+
+    def update(self, face_id: int, label: str) -> str | None:
+        """
+        Append label to the sliding window for face_id.
+        Returns the confirmed label if the window is full and unanimous,
+        otherwise None.
+        """
+        h = self._hist.setdefault(face_id, [])
+        h.append(label)
+        if len(h) > CONFIRM_FRAMES:
+            h.pop(0)
+
+        # Confirm only when window is full, all entries agree, and it's a real name
+        if len(h) == CONFIRM_FRAMES and len(set(h)) == 1 and h[0] != "Unknown":
+            return h[0]
+        return None
+
+    def is_pending(self, face_id: int) -> bool:
+        """True if we have some known-name hits but haven't confirmed yet."""
+        h = self._hist.get(face_id, [])
+        known = [x for x in h if x != "Unknown"]
+        return 0 < len(known) < CONFIRM_FRAMES
+
+    def clear_stale(self, active_ids: set):
+        """Remove history for face positions no longer visible in frame."""
+        for k in list(self._hist):
+            if k not in active_ids:
+                del self._hist[k]
 
 
-class FaceConfirmationBuffer:
-    """✓ IMPROVED: Track face detections and require consistency."""
-    def __init__(self, min_frames=MIN_MATCHES):
-        self.min_frames = min_frames
-        self.detection_history = {}  # {person_name: [count, avg_similarity]}
-    
-    def update(self, name: str, similarity: float) -> bool:
-        """Update detection and return True if confirmed after N consistent frames."""
-        if name == "Unknown":
-            # Reset all on unknown
-            self.detection_history.clear()
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 6 — ATTENDANCE CSV WRITER
+# ═══════════════════════════════════════════════════════════════
+
+class AttendanceWriter:
+    """
+    Attendance recorder with two-layer duplicate prevention:
+      Layer 1 — in-memory set (session-level, instant check)
+      Layer 2 — pandas CSV lookup (survives process restarts)
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._marked: set = set()
+        self._init_csv()
+
+    def _init_csv(self):
+        if not os.path.isfile(self.filepath):
+            with open(self.filepath, "w", newline="") as f:
+                csv.writer(f).writerow(["Name", "Date", "Time"])
+            log.info("Created attendance file: '%s'", self.filepath)
+
+    def _in_csv(self, name: str, today: str) -> bool:
+        try:
+            df = pd.read_csv(self.filepath)
+            return not df[(df["Name"] == name) & (df["Date"] == today)].empty
+        except (pd.errors.EmptyDataError, FileNotFoundError):
             return False
-        
-        if name not in self.detection_history:
-            self.detection_history[name] = [0, similarity]
-        
-        count, avg_sim = self.detection_history[name]
-        count += 1
-        # Track running average similarity
-        avg_sim = (avg_sim * (count - 1) + similarity) / count
-        self.detection_history[name] = [count, avg_sim]
-        
-        # ✓ IMPROVED: Confirmed after N frames AND avg similarity > threshold
-        if count >= self.min_frames and avg_sim >= 0.70:
-            log.info(f"✓ CONFIRMED [{count} frames, avg sim: {avg_sim:.2f}]: {name}")
-            return True
-        
-        log.debug(f"  Pending [{count}/{self.min_frames}] {name} (avg sim: {avg_sim:.2f})")
-        return False
-    
-    def reset(self):
-        """Reset buffer."""
-        self.detection_history.clear()
+
+    def record(self, name: str) -> bool:
+        """
+        Write a new attendance row.  Returns True if a new row was written.
+        Silently skips if already recorded today.
+        """
+        now   = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        key   = f"{name}|{today}"
+
+        if key in self._marked:
+            return False
+        self._marked.add(key)
+
+        if self._in_csv(name, today):
+            return False
+
+        with open(self.filepath, "a", newline="") as f:
+            csv.writer(f).writerow([name, today, now.strftime("%H:%M:%S")])
+        log.info("  [MARK] %-20s %s  %s", name, today, now.strftime("%H:%M:%S"))
+        return True
 
 
-def main():
-    print("=" * 54)
-    print("  Smart Facial Recognition Attendance (OpenCV Edition)")
-    print("=" * 54)
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 7 — DRAWING HELPERS
+# ═══════════════════════════════════════════════════════════════
 
-    # Load dataset
-    try:
-        images_dict = load_images_simple(DATASET_DIR)
-    except (FileNotFoundError, ValueError) as e:
-        log.error("%s", e)
-        return
+def draw_face_box(frame: np.ndarray,
+                  x: int, y: int, w: int, h: int,
+                  label: str, confidence: float,
+                  color: tuple, pending: bool = False) -> None:
+    """
+    Draw a bounding box, filled label strip, and LBPH confidence bar.
+    confidence is displayed as a percentage (higher = better match,
+    because we convert the LBPH distance to a 0–100 scale for display).
+    """
+    # Bounding box
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-    if not images_dict:
-        log.error("No valid images loaded from dataset.")
-        return
+    # Filled label strip at the bottom of the box
+    strip_h = 46
+    cv2.rectangle(frame, (x, y + h - strip_h), (x + w, y + h),
+                  color, cv2.FILLED)
 
-    log.info("Loaded %d person(s) with %d image(s) total.\n",
-             len(images_dict), sum(len(v) for v in images_dict.values()))
+    # Name
+    cv2.putText(frame, label,
+                (x + 6, y + h - strip_h + 18),
+                cv2.FONT_HERSHEY_DUPLEX, 0.62,
+                (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Load cascade classifier
-    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-    if face_cascade.empty():
-        log.error("Could not load face cascade classifier.")
-        return
+    # Confidence score + pending hint
+    conf_display = f"{confidence:.0f}% match"
+    if pending:
+        conf_display += "  [confirming…]"
+    cv2.putText(frame, conf_display,
+                (x + 6, y + h - 6),
+                cv2.FONT_HERSHEY_PLAIN, 0.85,
+                (220, 220, 220), 1, cv2.LINE_AA)
 
-    # Open webcam
-    cap = cv2.VideoCapture(0)
+    # Confidence bar (full width, 4 px above strip)
+    bar_w = int(w * min(confidence / 100.0, 1.0))
+    cv2.rectangle(frame,
+                  (x, y + h - strip_h - 5),
+                  (x + bar_w, y + h - strip_h - 1),
+                  color, cv2.FILLED)
+
+
+def draw_hud(frame: np.ndarray, face_count: int, fps: float) -> None:
+    cv2.putText(frame,
+                f"Faces: {face_count}  |  {fps:.1f} fps  |  Q = Quit",
+                (10, 30),
+                cv2.FONT_HERSHEY_PLAIN, 1.35, COL_HUD, 1, cv2.LINE_AA)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 8 — WEBCAM INITIALISATION
+# ═══════════════════════════════════════════════════════════════
+
+def open_webcam() -> cv2.VideoCapture:
+    """
+    Open webcam at WEBCAM_INDEX, with automatic fallback to indices 1–3.
+    Sets preferred resolution and minimises internal buffer lag.
+    The camera opens immediately when the script runs.
+    """
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
     if not cap.isOpened():
-        log.error("Cannot open webcam.")
-        return
+        for idx in range(1, 4):
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                log.warning("Webcam index %d failed; using index %d.",
+                            WEBCAM_INDEX, idx)
+                break
+        else:
+            raise IOError(
+                "No webcam detected. "
+                "Check the camera is connected and not used by another app."
+            )
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WEBCAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # Pull freshest frame, reduce lag
 
-    log.info("Webcam opened. Press Q to quit.\n")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    log.info("Webcam opened at %dx%d. Press  Q  to quit.\n", w, h)
+    return cap
 
-    initialize_csv(ATTENDANCE_FILE)
-    marked_today = set()
-    frame_count = 0
-    face_buffer = FaceConfirmationBuffer()  # ✓ Confirmation buffer
-    frame_cache = {}  # ✓ NEW: Cache detected face ROIs to avoid re-detection
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 9 — MAIN RECOGNITION LOOP
+# ═══════════════════════════════════════════════════════════════
+
+def recognize_faces(recognizer,
+                    label_map:  dict[int, str],
+                    cascade:    cv2.CascadeClassifier,
+                    writer:     AttendanceWriter) -> None:
+    """
+    Real-time recognition loop.
+
+    Per-frame pipeline
+    ------------------
+    1.  Grab frame from webcam
+    2.  Convert to grayscale + apply CLAHE
+    3.  Downsample the gray frame for faster detection
+    4.  Detect face bounding boxes (with 3-gate filter)
+    5.  For each face: crop, resize to FACE_SIZE, predict with LBPH
+    6.  Gate on LBPH_THRESHOLD  (conf < threshold → accept)
+    7.  Update N-frame confirmation buffer (per face position)
+    8.  Confirmed → AttendanceWriter.record()
+    9.  Draw annotations on full-size frame
+    10. Display; loop until Q
+    """
+    cap   = open_webcam()
+    clahe = make_clahe() if USE_CLAHE else None
+    buf   = ConfirmationBuffer()
+    inv   = 1.0 / FRAME_SCALE
+
+    frame_n   = 0
+    fps_cnt   = 0
+    fps       = 0.0
+    fps_tick  = cv2.getTickCount()
+
+    # Cache from last processed frame so skipped frames still draw boxes
+    cached_faces:  list = []   # (x, y, w, h) at full resolution
+    cached_labels: list = []   # (label, conf_pct, color, pending) per face
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            log.warning("Frame grab failed – retrying …")
             continue
 
-        frame_count += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_n += 1
+        fps_cnt += 1
 
-        # ✓ IMPROVED: Use stricter Haar cascade parameters
-        faces = face_cascade.detectMultiScale(gray, HAAR_SCALE, HAAR_MIN_NEIGHBORS)
-        
-        # ✓ FILTER: Remove tiny and oddly-sized faces
-        faces = [
-            (x, y, w, h) for (x, y, w, h) in faces 
-            if w >= MIN_FACE_SIZE and h >= MIN_FACE_SIZE 
-            and 0.6 < (w / max(h, 1)) < 1.4  # ✓ NEW: Aspect ratio check
-        ]
+        # Update FPS counter every 30 frames
+        if fps_cnt >= 30:
+            elapsed  = (cv2.getTickCount() - fps_tick) / cv2.getTickFrequency()
+            fps      = fps_cnt / max(elapsed, 1e-6)
+            fps_cnt  = 0
+            fps_tick = cv2.getTickCount()
 
-        # Match against dataset
-        current_frame_matches = {}  # Track matches in this frame
-        
-        for (x, y, w, h) in faces:
-            face_roi = frame[y:y+h, x:x+w]
-            best_name = "Unknown"
-            best_sim = 0.0
-            color = COL_UNKNOWN
+        # ── Run detection only on every Nth frame ────────────────────────
+        if frame_n % PROCESS_EVERY_N == 0:
 
-            # ✓ IMPROVED: Only compare against reference images of actual people
-            for name, ref_images in images_dict.items():
-                for ref_img in ref_images:
-                    matched, sim = match_face_simple(ref_img, face_roi, threshold=SIMILARITY_THRESHOLD)
-                    if sim > best_sim:
-                        best_sim = sim
-                        if matched:
-                            best_name = name
-                            color = COL_KNOWN
+            # Grayscale + CLAHE on downsampled frame for speed
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if clahe:
+                gray_full = apply_clahe_gray(gray_full, clahe)
 
-            # ✓ IMPROVED: Stricter acceptance logic
-            if best_name != "Unknown" and best_sim >= SIMILARITY_THRESHOLD:
-                confirmed = face_buffer.update(best_name, best_sim)
-                if confirmed:
-                    marked_today = mark_attendance(ATTENDANCE_FILE, best_name, marked_today)
-                    face_buffer.reset()
-                current_frame_matches[best_name] = best_sim
-            else:
-                # ✓ NEW: Reset if no good match found
-                face_buffer.reset()
+            small = cv2.resize(gray_full, (0, 0),
+                               fx=FRAME_SCALE, fy=FRAME_SCALE)
 
-            # Draw box
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            cv2.rectangle(frame, (x, y+h-35), (x+w, y+h), color, cv2.FILLED)
-            
-            # ✓ IMPROVED: Show similarity score for debugging
-            label_text = f"{best_name} ({best_sim:.2f})"
-            if best_name != "Unknown":
-                label_text += f" [{len([k for k, v in current_frame_matches.items() if k == best_name])}]"
-            
-            cv2.putText(frame, label_text, (x+6, y+h-10),
-                       cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+            # Detect faces in the small frame
+            small_faces = detect_faces(small, cascade)
 
-        # HUD
-        cv2.putText(frame, f"Faces: {len(faces)} | Q = Quit",
-                   (10, 30), cv2.FONT_HERSHEY_PLAIN, 1.2, COL_HUD, 1)
+            # Scale coordinates back to full frame
+            full_faces = [
+                (int(x * inv), int(y * inv),
+                 int(w * inv), int(h * inv))
+                for (x, y, w, h) in small_faces
+            ]
 
-        cv2.imshow("Attendance System (OpenCV)", frame)
+            new_labels   = []
+            active_ids   = set(range(len(full_faces)))
+
+            for fid, (fx, fy, fw, fh) in enumerate(full_faces):
+
+                # Crop face from full-res gray frame and normalise size
+                face_crop = gray_full[fy:fy + fh, fx:fx + fw]
+                face_crop = cv2.resize(face_crop, FACE_SIZE)
+
+                # LBPH prediction — returns (label_id, distance)
+                # Lower distance = better match
+                try:
+                    pred_label, lbph_conf = recognizer.predict(face_crop)
+                except cv2.error as e:
+                    log.debug("LBPH predict error: %s", e)
+                    new_labels.append(("Unknown", 0.0, COL_UNKNOWN, False))
+                    continue
+
+                # Convert LBPH distance to a 0–100% display score
+                # (purely for the on-screen bar — not the decision threshold)
+                display_pct = max(0.0, 100.0 - lbph_conf)
+
+                if lbph_conf < LBPH_THRESHOLD:
+                    # ── Match accepted ────────────────────────────────────
+                    proposed  = label_map.get(pred_label, "Unknown")
+                    confirmed = buf.update(fid, proposed)
+                    pending   = buf.is_pending(fid)
+
+                    if confirmed:
+                        label = confirmed
+                        color = COL_KNOWN
+                        writer.record(label)
+                        log.debug("CONFIRMED: %s  dist=%.1f", label, lbph_conf)
+                    elif pending:
+                        label = proposed   # Show tentative name while confirming
+                        color = COL_PENDING
+                    else:
+                        label = proposed
+                        color = COL_PENDING
+
+                else:
+                    # ── Match rejected (too low confidence) ───────────────
+                    label = "Unknown"
+                    color = COL_UNKNOWN
+                    buf.update(fid, "Unknown")
+                    log.debug("REJECTED: best=%s  dist=%.1f (threshold=%.1f)",
+                              label_map.get(pred_label, "?"),
+                              lbph_conf, LBPH_THRESHOLD)
+
+                new_labels.append((label, display_pct, color,
+                                   buf.is_pending(fid)))
+
+            buf.clear_stale(active_ids)
+            cached_faces  = full_faces
+            cached_labels = new_labels
+
+        # ── Draw cached annotations on every frame ────────────────────────
+        for i, (fx, fy, fw, fh) in enumerate(cached_faces):
+            if i < len(cached_labels):
+                lbl, conf_pct, col, pend = cached_labels[i]
+                draw_face_box(frame, fx, fy, fw, fh,
+                              lbl, conf_pct, col, pend)
+
+        draw_hud(frame, len(cached_faces), fps)
+        cv2.imshow("Attendance System  –  LBPH Edition", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             log.info("Q pressed – shutting down.")
@@ -331,23 +659,84 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    # Report
-    try:
-        df = pd.read_csv(ATTENDANCE_FILE)
-        if not df.empty:
-            today = datetime.now().strftime("%Y-%m-%d")
-            today_df = df[df["Date"] == today]
-            print(f"\n{'='*54}")
-            print(f"  Attendance for {today}")
-            print(f"{'='*54}")
-            if not today_df.empty:
-                for _, row in today_df.iterrows():
-                    print(f"  ✔  {row['Name']:<20} {row['Time']}")
-            print(f"{'='*54}\n")
-    except Exception:
-        pass
 
-    log.info("Session complete. Attendance saved.")
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 10 — POST-SESSION TERMINAL REPORT
+# ═══════════════════════════════════════════════════════════════
+
+def print_report(filepath: str) -> None:
+    try:
+        df = pd.read_csv(filepath)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        log.info("No attendance records found.")
+        return
+
+    if df.empty:
+        log.info("Attendance file is empty.")
+        return
+
+    today    = datetime.now().strftime("%Y-%m-%d")
+    today_df = df[df["Date"] == today]
+    sep = "═" * 54
+
+    print(f"\n{sep}\n  ATTENDANCE REPORT\n{sep}")
+    if today_df.empty:
+        print(f"  No entries for today ({today}).")
+    else:
+        print(f"  Date    : {today}")
+        print(f"  Present : {len(today_df)}\n")
+        for _, row in today_df.iterrows():
+            print(f"    ✔  {row['Name']:<22}  {row['Time']}")
+
+    print("\n  All-time totals:")
+    totals = df.groupby("Name").size().reset_index(name="Days")
+    for _, row in totals.iterrows():
+        print(f"    {row['Name']:<22}  {row['Days']} day(s)")
+    print(f"{sep}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    print("=" * 54)
+    print("  Smart Attendance System  —  LBPH Edition (No dlib)")
+    print("=" * 54)
+
+    # 1. Verify opencv-contrib-python is installed
+    try:
+        _check_contrib()
+    except ImportError as e:
+        print(e)
+        return
+
+    # 2. Load cascade classifier
+    cascade = cv2.CascadeClassifier(CASCADE_PATH)
+    if cascade.empty():
+        log.error("Could not load Haar cascade from: %s", CASCADE_PATH)
+        return
+
+    # 3. Build LBPH recognizer from dataset
+    try:
+        recognizer, label_map, _ = build_lbph_recognizer(DATASET_DIR, cascade)
+    except (FileNotFoundError, ValueError) as e:
+        log.error("%s", e)
+        return
+
+    # 4. Set up attendance writer
+    writer = AttendanceWriter(ATTENDANCE_FILE)
+
+    # 5. Run recognition loop (webcam opens here automatically)
+    try:
+        recognize_faces(recognizer, label_map, cascade, writer)
+    except IOError as e:
+        log.error("%s", e)
+        return
+
+    # 6. Print session report
+    print_report(ATTENDANCE_FILE)
+    log.info("Session complete. Attendance saved to '%s'.", ATTENDANCE_FILE)
 
 
 if __name__ == "__main__":
