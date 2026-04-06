@@ -70,18 +70,18 @@ ATTENDANCE_FILE = "attendance.csv"
 # LBPH recognizer settings
 # Lower confidence = better match. 0 = perfect, 100+ = poor match.
 # Tune here if recognition is too strict or too loose:
-LBPH_THRESHOLD = 70          # Accept match only if confidence < this value
-                              # Try 75 if faces are missed; try 60 if wrong person shown
+LBPH_THRESHOLD = 50         # Accept match only if confidence < this value
+                              # Try 50 if faces are missed; try 40 if wrong person shown
 
 # Face detection (Haar cascade)
 CASCADE_PATH        = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 HAAR_SCALE          = 1.08   # Smaller = more detections but slower (1.05–1.15)
-HAAR_MIN_NEIGHBORS  = 8      # Higher = fewer false positives (6–10)
+HAAR_MIN_NEIGHBORS  = 9      # Higher = fewer false positives (6–10)
 MIN_FACE_SIZE       = 80     # Pixels — rejects hands, shadows, small objects
 MAX_FACE_RATIO      = 1.5    # Max width/height ratio — rejects elongated shapes
 
 # Confirmation: require N consecutive matching frames before marking attendance
-CONFIRM_FRAMES  = 5          # At ~15 fps effective = ~330 ms of agreement
+CONFIRM_FRAMES  = 6         # At ~15 fps effective = ~530 ms of agreement (more time = less false positives)
 
 # Frame processing
 PROCESS_EVERY_N = 2          # Detect on every Nth frame (reduces CPU load)
